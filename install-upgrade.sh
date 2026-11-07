@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Install or upgrade the official DSH npm package on Ubuntu and WSL2.
 # Keep program releases, user data and caches under DSH_BASE; never install globally.
+# Node is picked from the selected DSH release's engines.node range, so upgrading
+# DSH also upgrades the runtime it needs; pnpm stays installer-owned.
 # Pair this entry point with dshctl.sh from the same repository checkout.
 set -euo pipefail
 umask 077
@@ -9,10 +11,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DSH_BASE="${DSH_BASE:-$HOME/deepseek-harness}"
 DSH_VERSION="${DSH_VERSION:-latest}"
 NODE_VERSION="${NODE_VERSION:-}"
+PNPM_VERSION="${PNPM_VERSION:-11.7.0}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 NETWORK_TIMEOUT="${NETWORK_TIMEOUT:-300}"
 START_SERVICE=1
 DRY_RUN=0
+NODE_VERSION_OVERRIDE=0
+[ -z "$NODE_VERSION" ] || NODE_VERSION_OVERRIDE=1
 
 usage() {
   cat <<'EOF'
@@ -30,11 +35,16 @@ Options:
 Environment:
   DSH_BASE         Installation root (default: ~/deepseek-harness)
   DSH_VERSION      npm version/tag (default: latest, not next)
-  NODE_VERSION     Official Node 22 version, e.g. v22.23.4 (default: latest 22 LTS)
+  NODE_VERSION     Pin an official Node release, e.g. v24.9.0
+                   (default: newest stable Node satisfying the DSH release engines.node)
+  PNPM_VERSION     Exact pnpm release used for plugin management (default: 11.7.0)
   NPM_REGISTRY     npm registry (default: https://registry.npmjs.org)
   NETWORK_TIMEOUT Network step timeout in seconds (default: 300)
 
 DSH data, workspace, logs, downloads and backups stay under DSH_BASE.
+Node is selected from the engines.node declared by the DSH version being installed:
+the newest stable release satisfying that range. Releases that declare no
+engines.node fall back to the Node 22 LTS line (>=22.19.0).
 dshmarket is installed by default. Other third-party plugins are preserved.
 The Web port is owned by DSH; this installer does not pass --port.
 On startup failure, restore the previous program and Web profile, not all user data.
@@ -42,6 +52,7 @@ On startup failure, restore the previous program and Web profile, not all user d
 Examples:
   bash install-upgrade.sh
   bash install-upgrade.sh --version 0.2.1-rc.2
+  NODE_VERSION=v26.13.0 bash install-upgrade.sh --version 0.2.2-rc.1
   DSH_BASE=/absolute/path/to/dsh bash install-upgrade.sh
 EOF
 }
@@ -59,9 +70,10 @@ done
 
 [[ "$DSH_BASE" = /* && "$DSH_BASE" != / ]] || die "DSH_BASE must be an absolute directory, not /"
 [[ "$DSH_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9.+_-]*$ ]] || die "Invalid DSH version/tag"
+[[ "$PNPM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "PNPM_VERSION must be an exact pnpm release, e.g. 11.7.0"
 [[ "$NETWORK_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "NETWORK_TIMEOUT must be positive"
 echo "[PLAN] Install root: $DSH_BASE"
-echo "[PLAN] DSH: $DSH_VERSION; Node: ${NODE_VERSION:-latest Node 22 LTS}"
+echo "[PLAN] DSH: $DSH_VERSION; Node: ${NODE_VERSION:-auto from DSH engines.node (fallback Node 22 LTS)}; pnpm: $PNPM_VERSION"
 echo "[PLAN] Web: DSH default port (3080); start=$START_SERVICE; plugin=dshmarket"
 if [ "$DRY_RUN" = 1 ]; then
   echo "[DRY-RUN] No downloads or filesystem changes."
@@ -85,23 +97,206 @@ download() {
   curl --fail --location --retry 2 --connect-timeout 20 --max-time "$NETWORK_TIMEOUT" "$1" -o "$2"
 }
 
-# Download an isolated Node runtime and verify its archive before executing it.
-if [ -z "$NODE_VERSION" ]; then
-  download https://nodejs.org/dist/index.json "$DSH_BASE/downloads/node-index.json"
-  NODE_VERSION="$(python3 - "$DSH_BASE/downloads/node-index.json" <<'PY'
+# Semver helper shared by Node selection and NODE_VERSION validation: engines.node
+# is a range, but nodejs.org only offers fixed releases, so one side must be mapped.
+node_selector="$DSH_BASE/tmp/select-node.py"
+cat > "$node_selector" <<'PY'
+import json
+import re
+import sys
+
+WILDCARDS = {"", "*", "x", "X"}
+VERSION = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+][0-9A-Za-z.+-]+)?$")
+STABLE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_version(text):
+    match = VERSION.fullmatch(str(text).strip())
+    if not match:
+        fail(f"unsupported version {text!r}")
+    parts = tuple(int(part) if part is not None else 0 for part in match.groups())
+    precision = sum(part is not None for part in match.groups())
+    return parts, precision
+
+
+def parse_range_version(text):
+    raw = str(text).strip().lstrip("v")
+    raw = raw.split("-", 1)[0].split("+", 1)[0]
+    numbers = []
+    for segment in raw.split("."):
+        if segment in ("x", "X", "*"):
+            break
+        if not segment.isdigit():
+            fail(f"unsupported version {text!r}")
+        numbers.append(int(segment))
+    if not numbers:
+        fail(f"unsupported version {text!r}")
+    precision = len(numbers)
+    return tuple(numbers + [0] * (3 - precision)), precision
+
+
+def split_condition(condition):
+    condition = condition.strip()
+    if condition in WILDCARDS:
+        return []
+    match = re.fullmatch(r"(\^|~|>=|<=|>|<|=)?\s*(v?[0-9xX*][0-9A-Za-z.xX*+-]*)", condition)
+    if not match:
+        fail(f"unsupported engines.node condition {condition!r}")
+    operator = match.group(1) or "="
+    version, precision = parse_range_version(match.group(2))
+    if operator == "=":
+        if precision == 1:
+            return [(">=", version), ("<", (version[0] + 1, 0, 0))]
+        if precision == 2:
+            return [(">=", version), ("<", (version[0], version[1] + 1, 0))]
+        return [("=", version)]
+    if operator == "^":
+        if precision == 1 or version[0] > 0:
+            upper = (version[0] + 1, 0, 0)
+        elif version[1] > 0:
+            upper = (0, version[1] + 1, 0)
+        else:
+            upper = (0, 0, version[2] + 1)
+        return [(">=", version), ("<", upper)]
+    if operator == "~":
+        upper = (version[0] + 1, 0, 0) if precision == 1 else (version[0], version[1] + 1, 0)
+        return [(">=", version), ("<", upper)]
+    return [(operator, version)]
+
+
+def parse_range(expression):
+    expression = (expression or "").strip()
+    if expression in WILDCARDS:
+        return [[]]
+    alternatives = []
+    for chunk in expression.split("||"):
+        chunk = chunk.strip()
+        if not chunk:
+            fail(f"unsupported engines.node range {expression!r}")
+        hyphen = re.fullmatch(r"(\S+)\s+-\s+(\S+)", chunk)
+        if hyphen:
+            low, _ = parse_version(hyphen.group(1))
+            high, high_precision = parse_version(hyphen.group(2))
+            if high_precision == 3:
+                alternatives.append([(">=", low), ("<=", high)])
+            elif high_precision == 2:
+                alternatives.append([(">=", low), ("<", (high[0], high[1] + 1, 0))])
+            else:
+                alternatives.append([(">=", low), ("<", (high[0] + 1, 0, 0))])
+            continue
+        chunk = re.sub(r"(?<=[><=~^])\s+", "", chunk)
+        comparators = []
+        for token in chunk.split():
+            comparators.extend(split_condition(token))
+        alternatives.append(comparators)
+    return alternatives
+
+
+def compare(version, operator, target):
+    if operator == ">=":
+        return version >= target
+    if operator == ">":
+        return version > target
+    if operator == "<=":
+        return version <= target
+    if operator == "<":
+        return version < target
+    return version == target
+
+
+def satisfies(version, expression):
+    return any(
+        all(compare(version, operator, target) for operator, target in alternative)
+        for alternative in parse_range(expression)
+    )
+
+
+def select(index_path, expression):
+    with open(index_path, encoding="utf-8") as source:
+        entries = json.load(source)
+    candidates = []
+    for entry in entries:
+        match = STABLE.fullmatch(str(entry.get("version", "")))
+        if not match:
+            continue
+        version = tuple(map(int, match.groups()))
+        if satisfies(version, expression):
+            candidates.append(version)
+    if not candidates:
+        fail(f"no stable Node release satisfies engines.node {expression!r}")
+    # Take the newest stable release the declared range allows: the installer
+    # should run the newest Node the DSH release supports on this system, not
+    # the oldest one it tolerates.
+    version = max(candidates)
+    print("v%d.%d.%d" % version)
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else ""
+    if action == "select" and len(sys.argv) == 4:
+        select(sys.argv[2], sys.argv[3])
+    elif action == "check" and len(sys.argv) == 4:
+        version, _ = parse_version(sys.argv[3])
+        if not satisfies(version, sys.argv[2]):
+            fail("Node v%d.%d.%d does not satisfy engines.node %r" % (version + (sys.argv[2],)))
+    else:
+        fail("usage: select-node.py select <index.json> <range> | select-node.py check <range> <version>")
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+# Read the published metadata for the requested DSH version/tag before choosing a
+# runtime: engines.node is the release's own contract for which Node it supports.
+metadata="$DSH_BASE/downloads/dsh-packument.json"
+download "${NPM_REGISTRY%/}/@deepseek-ai%2fdsh" "$metadata" || die "Could not fetch DSH metadata from $NPM_REGISTRY"
+resolved="$(python3 - "$metadata" "$DSH_VERSION" <<'PY'
 import json
 import sys
+
 with open(sys.argv[1], encoding="utf-8") as source:
-    entries = json.load(source)
-versions = [entry["version"] for entry in entries if entry["version"].startswith("v22.") and entry.get("lts")]
-versions = [version for version in versions if tuple(map(int, version[1:].split("."))) >= (22, 19, 0)]
-if not versions:
-    raise SystemExit("No supported Node 22 LTS release found")
-print(max(versions, key=lambda version: tuple(map(int, version[1:].split(".")))))
+    packument = json.load(source)
+spec = sys.argv[2]
+version = (packument.get("dist-tags") or {}).get(spec) or spec
+manifest = (packument.get("versions") or {}).get(version)
+if not isinstance(manifest, dict):
+    raise SystemExit(f"DSH {spec} is not published on the configured npm registry")
+engines = manifest.get("engines") if isinstance(manifest.get("engines"), dict) else {}
+print(manifest.get("version") or version)
+print(engines.get("node") or "")
 PY
-)"
+)" || die "Could not resolve DSH $DSH_VERSION; check the version/tag and NPM_REGISTRY"
+version="$(printf '%s\n' "$resolved" | sed -n '1p')"
+node_range="$(printf '%s\n' "$resolved" | sed -n '2p')"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "Invalid resolved DSH version: $version"
+if [ -n "$node_range" ]; then
+  node_select_range="$node_range"
+  node_check_range="$node_range"
+  echo "[INFO] DSH $version declares engines.node '$node_range'"
+else
+  # Releases before the engines field existed were supported on Node 22 LTS.
+  node_select_range=">=22.19.0 <23.0.0"
+  node_check_range=">=22.19.0"
+  echo "[INFO] DSH $version declares no engines.node; using the Node 22 LTS baseline"
 fi
-[[ "$NODE_VERSION" =~ ^v22\.[0-9]+\.[0-9]+$ ]] || die "NODE_VERSION must be an official v22.x.y release"
+if [ -z "$NODE_VERSION" ]; then
+  download https://nodejs.org/dist/index.json "$DSH_BASE/downloads/node-index.json" || die "Could not download the Node release index"
+  NODE_VERSION="$(python3 "$node_selector" select "$DSH_BASE/downloads/node-index.json" "$node_select_range")" || die "No Node release satisfies the DSH $version requirement"
+fi
+NODE_VERSION="${NODE_VERSION#v}"
+[[ "$NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "NODE_VERSION must be an official Node release such as v24.9.0"
+if [ "$NODE_VERSION_OVERRIDE" = 1 ]; then
+  python3 "$node_selector" check "$node_check_range" "v$NODE_VERSION" || die "NODE_VERSION=v$NODE_VERSION is incompatible with DSH $version; omit NODE_VERSION to select a matching Node release"
+fi
+NODE_VERSION="v$NODE_VERSION"
+
+# Download an isolated Node runtime and verify its archive before executing it.
 node_name="node-$NODE_VERSION-$arch"
 node_dir="$DSH_BASE/nodes/$node_name"
 archive="$node_name.tar.xz"
@@ -117,7 +312,9 @@ if [ ! -x "$node_dir/bin/node" ]; then
   tar -xJf "$DSH_BASE/downloads/$archive" -C "$DSH_BASE/nodes"
 fi
 export PATH="$node_dir/bin:$PATH"
-node -e 'const version=process.versions.node.split(".").map(Number); if(version[0]!==22 || version[1]<19) process.exit(1)' || die "Node >=22.19 is required"
+[ -x "$node_dir/bin/npm" ] || die "Node archive is missing npm: $node_dir/bin/npm"
+actual_node_version="$("$node_dir/bin/node" --version 2>/dev/null || true)"
+[ "$actual_node_version" = "$NODE_VERSION" ] || die "Downloaded Node reports '${actual_node_version:-no version}', expected $NODE_VERSION"
 export npm_config_registry="$NPM_REGISTRY"
 export npm_config_cache="$DSH_BASE/cache/npm"
 export npm_config_devdir="$DSH_BASE/cache/node-gyp"
@@ -125,18 +322,20 @@ export XDG_CACHE_HOME="$DSH_BASE/cache"
 export TMPDIR="$DSH_BASE/tmp"
 export npm_config_fetch_timeout="$((NETWORK_TIMEOUT * 1000))"
 export npm_config_fetch_retries=1
-version="$(timeout "$NETWORK_TIMEOUT" npm view "@deepseek-ai/dsh@$DSH_VERSION" version --json | node -e 'let text="";process.stdin.on("data",chunk=>text+=chunk);process.stdin.on("end",()=>{const result=JSON.parse(text);if(typeof result!=="string")process.exit(1);console.log(result)})')"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "Invalid resolved npm version: $version"
-echo "[INFO] Resolved DSH $version, Node $NODE_VERSION"
+echo "[INFO] Resolved DSH $version, Node $NODE_VERSION, pnpm $PNPM_VERSION"
 
 # Prepare the new program before interrupting an existing service.
 release="$DSH_BASE/releases/dsh-$version-$(date +%Y%m%d%H%M%S)-$$"
 mkdir -p "$release/app"
 ln -s "$node_dir" "$release/node"
 printf '{"name":"dsh-ubuntu-online","private":true}\n' > "$release/app/package.json"
-timeout "$NETWORK_TIMEOUT" npm install --prefix "$release/app" --save-exact --omit=dev --no-audit --no-fund "@deepseek-ai/dsh@$version" pnpm@11.7.0
+timeout "$NETWORK_TIMEOUT" npm install --prefix "$release/app" --save-exact --omit=dev --no-audit --no-fund "@deepseek-ai/dsh@$version" "pnpm@$PNPM_VERSION"
 cli="$release/app/node_modules/@deepseek-ai/dsh/lib/bin.js"
 [ -f "$cli" ] || die "Official DSH CLI missing after install"
+pnpm_cli="$release/app/node_modules/pnpm/bin/pnpm.cjs"
+[ -f "$pnpm_cli" ] || die "pnpm $PNPM_VERSION is missing after install"
+pnpm_version="$("$release/node/bin/node" "$pnpm_cli" --version 2>/dev/null || true)"
+[ "$pnpm_version" = "$PNPM_VERSION" ] || die "pnpm reports '${pnpm_version:-no version}' on Node $NODE_VERSION; set PNPM_VERSION to a release compatible with that Node"
 "$release/node/bin/node" "$cli" --version
 
 old_release=""

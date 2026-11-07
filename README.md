@@ -6,7 +6,7 @@
 
 | 文件 | 用途 |
 |---|---|
-| `install-upgrade.sh` | 首次安装与后续升级，准备私有 Node/pnpm，并安装插件市场 |
+| `install-upgrade.sh` | 首次安装与后续升级，按 dsh 版本准备私有 Node/pnpm，并安装插件市场 |
 | `dshctl.sh` | 启动、停止、重启、查看状态与日志 |
 | `test-install.cjs` | 不访问外网的安装、升级和回滚集成测试 |
 | `.gitignore` | 排除运行数据、测试产物、环境配置及日志 |
@@ -18,7 +18,7 @@
 - 能访问 `https://nodejs.org` 和 npm registry；第三方依赖的安装脚本还可能访问其发布站点。
 - 默认使用 dsh 自身的本机监听地址及端口，当前端口为 **3080**。安装前确认端口没有被其他服务占用。
 
-脚本会下载 Node 22 LTS（至少 22.19），对照官方 SHA-256 清单校验下载归档，并私有安装 pnpm 11.7.0；不要求预装 Node 或 npm。缺少系统命令时请管理员通过 Ubuntu 软件源准备，脚本不会自动提权。若原生依赖没有可用的预编译产物，可能还需要 Python 和 `build-essential` 等构建工具；不要通过忽略安装脚本绕过原生模块构建。
+脚本会先读取所选 dsh 版本在 npm registry 上发布的 `engines.node`，再从 nodejs.org 选择满足该范围的最新稳定版本，因此升级 dsh 时会自动跟随新的 Node 要求。例如 `0.2.2-rc.1` 声明 `>=24.9.0`，默认选择当前最新的 Node 26；尚未声明 `engines.node` 的旧版本回退到 Node 22 LTS（不低于 22.19.0），与旧版脚本行为一致。Node 下载归档会对照官方 SHA-256 清单校验；pnpm 默认私有安装 11.7.0，可用 `PNPM_VERSION` 覆盖，安装后会用所选 Node 实际运行校验。脚本不要求预装 Node 或 npm。缺少系统命令时请管理员通过 Ubuntu 软件源准备，脚本不会自动提权。若原生依赖没有可用的预编译产物，可能还需要 Python 和 `build-essential` 等构建工具；不要通过忽略安装脚本绕过原生模块构建。
 
 ## 安装与升级
 
@@ -31,6 +31,8 @@ bash install-upgrade.sh
 
 目录位置可以不同，两个 shell 脚本应放在同一个目录。首次执行安装，再次执行升级；不需要预先卸载。默认查询官方 npm 的 `latest`，不自动选择 `next` 或 alpha，但 `latest` 本身仍可能指向 RC；执行前后以实际输出版本为准。同一版本重复执行也会创建新的安装目录，并非跳过安装。
 
+升级时会重新读取新 dsh 版本的 `engines.node`：要求提高时自动下载对应 Node，已有运行时会保留在 `nodes/` 下不会被删除；若 `NODE_VERSION` 被手动固定为不满足新要求的版本，安装会在下载程序前失败，去掉该变量即可自动选择。
+
 默认通过 `dsh plugin --profile web add dshmarket` 安装、启用插件市场。每次安装或升级都会执行该步骤，不自动升级其他第三方插件。原有插件配置、会话和模型配置会保留；不代表旧插件一定兼容新的 dsh，仍需在页面验收。
 
 ### 参数
@@ -38,7 +40,7 @@ bash install-upgrade.sh
 | 参数 | 行为 |
 |---|---|
 | `--version <值>` | 指定 npm 精确版本或发布标签，优先于 `DSH_VERSION` |
-| `--dry-run` | 仅显示计划，不联网、不写文件、不验证远端版本是否存在 |
+| `--dry-run` | 仅显示计划，不联网、不写文件、不验证远端版本是否存在，也不解析 `engines.node` |
 | `--no-start` | 安装完成后不启动 Web；升级时若旧服务正在运行，会先停止它 |
 | `-h`、`--help` | 显示帮助 |
 
@@ -63,9 +65,12 @@ bash dshctl.sh start
 |---|---|---|
 | `DSH_BASE` | `~/deepseek-harness` | 安装和数据根目录，必须是绝对路径且不能是 `/` |
 | `DSH_VERSION` | `latest` | dsh 的 npm 版本或发布标签 |
-| `NODE_VERSION` | 自动选择最新 Node 22 LTS | 可固定为官方版本，例如 `v22.23.4`，必须至少为 22.19 |
-| `NPM_REGISTRY` | `https://registry.npmjs.org` | npm registry，不改变 nodejs.org 的下载地址 |
+| `NODE_VERSION` | 自动选择满足所选 dsh `engines.node` 的最新稳定版本 | 可固定为官方版本，例如 `v24.22.2`（长期支持版）；必须满足该 dsh 版本的 `engines.node`，否则安装失败 |
+| `PNPM_VERSION` | `11.7.0` | 插件管理使用的 pnpm 精确版本；安装后会验证它能被所选 Node 运行 |
+| `NPM_REGISTRY` | `https://registry.npmjs.org` | npm registry，同时用于读取 dsh 版本元数据，不改变 nodejs.org 的下载地址 |
 | `NETWORK_TIMEOUT` | `300` | 网络请求／安装步骤的超时秒数，不是全流程总耗时 |
+
+`engines.node` 是 dsh 包自身声明的最低 Node 要求，脚本据此选择 Node，而不是读取本机已装的 Node。默认选择满足范围的最新稳定版本（可能是不属于 LTS 的当前版）；需要长期支持版时用 `NODE_VERSION` 固定一个满足范围的 LTS 版本。完全没有满足范围的版本时安装失败。尚未声明 `engines.node` 的旧版 dsh 使用 Node 22 LTS 基线（`>=22.19.0 <23.0.0`）。pnpm 版本不由 dsh 声明，仍由本脚本固定，升级 dsh 后如遇插件安装异常可调整 `PNPM_VERSION`。
 
 脚本不提供自定义 Web 端口参数，不传 `--port`。默认安装到当前用户 home 目录下的 `deepseek-harness/`，不会写入仓库目录。可通过 `DSH_BASE` 指定自定义绝对路径；自定义安装目录时，后续安装和服务管理也必须传入相同的 `DSH_BASE`，脚本不会自动记住它：
 
@@ -120,7 +125,7 @@ bash dshctl.sh logs 200
 ```text
 ~/deepseek-harness/
 	current -> releases/dsh-<版本>-<时间>-<进程号>/
-	nodes/       私有 Node 运行环境
+	nodes/       各版本私有 Node 运行环境（升级不会删除旧版本）
 	releases/    每次安装的程序版本和 profile 暂存／恢复副本
 	data/        dsh 数据、会话、模型配置及 profiles/web
 	workspace/   默认工作目录
@@ -137,7 +142,7 @@ bash dshctl.sh logs 200
 
 ## 排查与验证
 
-启动失败时先运行 `bash dshctl.sh status` 和 `bash dshctl.sh logs 200`。端口被占用时不要盲目停止其他进程；依赖下载失败时检查网络和 registry，安装耗时超过限制时可调整 `NETWORK_TIMEOUT`。启动检查验证认证跳转、HTTP 2xx 和已知插件加载错误，不保证浏览器全部插件或模型调用可用。
+启动失败时先运行 `bash dshctl.sh status` 和 `bash dshctl.sh logs 200`。端口被占用时不要盲目停止其他进程；依赖下载失败时检查网络和 registry，安装耗时超过限制时可调整 `NETWORK_TIMEOUT`。输出 `NODE_VERSION=... is incompatible with DSH ...` 时，说明手动固定的 Node 不满足该 dsh 版本的 `engines.node`，去掉 `NODE_VERSION` 让脚本自动选择即可。启动检查验证认证跳转、HTTP 2xx 和已知插件加载错误，不保证浏览器全部插件或模型调用可用。
 
 开发测试需要已有 Node 22.19+、curl、tar 和 xz，在仓库根目录执行：
 
