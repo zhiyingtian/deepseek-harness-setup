@@ -104,12 +104,14 @@ function fakeNpmSource() {
 const fs = require('node:fs');
 const path = require('node:path');
 const args = process.argv.slice(2);
-const version = process.env.TEST_VERSION || ${JSON.stringify(dshDefaultVersion)};
 if (args[0] !== 'install') process.exit(2);
 if (process.env.TEST_INSTALL_FAIL === '1') process.exit(1);
 const pnpmSpec = args.find(arg => arg.startsWith('pnpm@'));
 const dshSpec = args.find(arg => arg.startsWith('@deepseek-ai/dsh@'));
 if (!pnpmSpec || !dshSpec) process.exit(2);
+// Mirror the resolved version that the installer asked for (auto channel may pick
+// the next tag, so TEST_VERSION alone is not enough).
+const version = dshSpec.slice('@deepseek-ai/dsh@'.length);
 const pnpmVersion = process.env.TEST_PNPM_FAIL === '1' ? '0.0.0' : pnpmSpec.slice('pnpm@'.length);
 const prefix = args[args.indexOf('--prefix') + 1];
 const lib = path.join(prefix, 'node_modules/@deepseek-ai/dsh/lib');
@@ -155,14 +157,20 @@ function archiveFor(name) {
  return target;
 }
 if (url.endsWith('/@deepseek-ai%2fdsh') || url.endsWith('/@deepseek-ai/dsh')) {
- // Packument: dist-tags.latest resolves to TEST_VERSION; engines only when TEST_NODE_ENGINES is set.
+ // Packument: TEST_VERSION is the latest tag, TEST_NEXT_VERSION the next tag (default
+ // same), and both versions are published so auto channel selection can compare them.
  const version = process.env.TEST_VERSION || ${JSON.stringify(dshDefaultVersion)};
- const manifest = { version };
+ const nextVersion = process.env.TEST_NEXT_VERSION || version;
  const engines = process.env.TEST_NODE_ENGINES;
- if (engines) manifest.engines = { node: engines };
+ const manifestFor = value => {
+  const manifest = { version: value };
+  if (engines) manifest.engines = { node: engines };
+  return manifest;
+ };
  const versions = {};
- versions[version] = manifest;
- fs.writeFileSync(output, JSON.stringify({'dist-tags': {latest: version, next: version}, versions}));
+ versions[version] = manifestFor(version);
+ versions[nextVersion] = manifestFor(nextVersion);
+ fs.writeFileSync(output, JSON.stringify({'dist-tags': {latest: version, next: nextVersion}, versions}));
 } else if (url.endsWith('/dist/index.json')) {
  fs.copyFileSync(path.join(fixtures, 'node-index.json'), output);
 } else if (url.endsWith('/SHASUMS256.txt')) {
@@ -202,7 +210,7 @@ function createFixture(prefix) {
   // Redirect downloads and package installation into this disposable fixture only.
   const env = { ...process.env, PATH: `${tools}:${process.env.PATH}`, TEST_FIXTURES: fixtures };
   for (const key of ['DSH_BASE', 'DSH_VERSION', 'NODE_VERSION', 'PNPM_VERSION', 'NPM_REGISTRY',
-    'NETWORK_TIMEOUT', 'TEST_VERSION', 'TEST_NODE_ENGINES', 'TEST_INSTALL_FAIL',
+    'NETWORK_TIMEOUT', 'TEST_VERSION', 'TEST_NEXT_VERSION', 'TEST_NODE_ENGINES', 'TEST_INSTALL_FAIL',
     'TEST_PLUGIN_FAIL', 'TEST_PNPM_FAIL', 'TEST_PORT']) {
     delete env[key];
   }
@@ -268,11 +276,13 @@ test('online installer: install, restart, upgrade, data backup and failed-start 
     let result = await install({}, ['--dry-run']);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(fs.existsSync(base), false);
-    assert.match(result.stdout, /\[PLAN\] DSH: latest; Node: auto from DSH engines\.node \(fallback Node 22 LTS\); pnpm: 11\.7\.0/);
+    assert.match(result.stdout, /\[PLAN\] DSH: auto \(newer of latest\/next\); Node: auto from DSH engines\.node \(fallback Node 22 LTS\); pnpm: 11\.7\.0/);
     assert.match(result.stdout, /DSH default port \(3080\)/);
     assert.match(result.stdout, /plugin=dshmarket/);
     result = await install();
     assert.equal(result.code, 0, result.stdout + result.stderr);
+    // No explicit version => auto channel; here both tags point at the same release.
+    assert.match(result.stdout, /\[INFO\] auto channel: latest=1\.0\.0, next=1\.0\.0; selected 1\.0\.0/);
     // No engines.node on this fixture release => documented Node 22 LTS baseline.
     assert.match(result.stdout, /\[INFO\] DSH 1\.0\.0 declares no engines\.node; using the Node 22 LTS baseline/);
     assert.match(result.stdout, /\[INFO\] Resolved DSH 1\.0\.0, Node v22\.23\.4, pnpm 11\.7\.0/);
@@ -372,18 +382,80 @@ test('engines.node drives Node selection; NODE_VERSION and PNPM_VERSION are vali
     result = await run('bash', ['install-upgrade.sh', '--dry-run'],
       { ...env, DSH_BASE: freshBase, NODE_VERSION: 'v24.9.0', TEST_NODE_ENGINES: engines });
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /\[PLAN\] DSH: latest; Node: v24\.9\.0; pnpm: 11\.7\.0/);
+    assert.match(result.stdout, /\[PLAN\] DSH: auto \(newer of latest\/next\); Node: v24\.9\.0; pnpm: 11\.7\.0/);
     assert.equal(fs.existsSync(freshBase), false);
     result = await run('bash', ['install-upgrade.sh', '--dry-run'],
       { ...env, DSH_BASE: freshBase, PNPM_VERSION: '12.0.0' });
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /\[PLAN\] DSH: latest; Node: auto from DSH engines\.node \(fallback Node 22 LTS\); pnpm: 12\.0\.0/);
+    assert.match(result.stdout, /\[PLAN\] DSH: auto \(newer of latest\/next\); Node: auto from DSH engines\.node \(fallback Node 22 LTS\); pnpm: 12\.0\.0/);
     assert.equal(fs.existsSync(freshBase), false);
     result = await run('bash', ['install-upgrade.sh', '--dry-run'],
       { ...env, DSH_BASE: freshBase, PNPM_VERSION: 'bad' });
     assert.equal(result.code, 1);
     assert.match(result.stderr, /PNPM_VERSION must be an exact pnpm release, e\.g\. 11\.7\.0/);
     assert.equal(fs.existsSync(freshBase), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('auto channel installs the newer of latest/next; explicit --version stays pinned', async () => {
+  const { directory, env: fixtureEnv } = createFixture('channels-');
+  // --no-start keeps each case fast; the release name and installed fixture version
+  // are what prove which channel was selected.
+  async function install(base, extraEnv, args = ['--no-start']) {
+    return run('bash', ['install-upgrade.sh', ...args], { ...fixtureEnv, DSH_BASE: base, ...extraEnv });
+  }
+  function installedVersion(base) {
+    return fs.readFileSync(
+      path.join(base, 'current/app/node_modules/@deepseek-ai/dsh/lib/version.txt'), 'utf8');
+  }
+  try {
+    // (a) `next` carries the newer prerelease => auto channel installs it.
+    let base = path.join(directory, 'auto-next');
+    let result = await install(base, { TEST_VERSION: '1.0.0', TEST_NEXT_VERSION: '1.1.0-rc.1' });
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /\[PLAN\] DSH: auto \(newer of latest\/next\)/);
+    assert.match(result.stdout, /\[INFO\] auto channel: latest=1\.0\.0, next=1\.1\.0-rc\.1; selected 1\.1\.0-rc\.1/);
+    assert.match(result.stdout, /\[INFO\] Resolved DSH 1\.1\.0-rc\.1, Node v22\.23\.4, pnpm 11\.7\.0/);
+    assert.match(path.basename(fs.readlinkSync(path.join(base, 'current'))), /^dsh-1\.1\.0-rc\.1-/);
+    assert.equal(installedVersion(base), '1.1.0-rc.1');
+
+    // (b) A stable release outranks its own RC even though `next` names the RC.
+    base = path.join(directory, 'auto-stable');
+    result = await install(base, { TEST_VERSION: '1.2.0', TEST_NEXT_VERSION: '1.2.0-rc.1' });
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /\[INFO\] auto channel: latest=1\.2\.0, next=1\.2\.0-rc\.1; selected 1\.2\.0/);
+    assert.match(result.stdout, /\[INFO\] Resolved DSH 1\.2\.0, /);
+    assert.doesNotMatch(result.stdout, /Resolved DSH 1\.2\.0-rc\.1/);
+    assert.equal(installedVersion(base), '1.2.0');
+
+    // (c) Prerelease identifiers compare numerically: rc.10 is newer than rc.9.
+    base = path.join(directory, 'auto-rc10');
+    result = await install(base, { TEST_VERSION: '1.1.0-rc.9', TEST_NEXT_VERSION: '1.1.0-rc.10' });
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /\[INFO\] auto channel: latest=1\.1\.0-rc\.9, next=1\.1\.0-rc\.10; selected 1\.1\.0-rc\.10/);
+    assert.equal(installedVersion(base), '1.1.0-rc.10');
+
+    // (d) Explicit `latest` ignores the newer next tag and prints no auto-channel line.
+    base = path.join(directory, 'explicit-latest');
+    result = await install(base,
+      { TEST_VERSION: '1.0.0', TEST_NEXT_VERSION: '1.1.0-rc.1' }, ['--no-start', '--version', 'latest']);
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /\[PLAN\] DSH: latest;/);
+    assert.doesNotMatch(result.stdout, /auto channel/);
+    assert.match(result.stdout, /\[INFO\] Resolved DSH 1\.0\.0, /);
+    assert.equal(installedVersion(base), '1.0.0');
+
+    // (e) Explicit `next` installs the prerelease without the auto-channel line.
+    base = path.join(directory, 'explicit-next');
+    result = await install(base,
+      { TEST_VERSION: '1.0.0', TEST_NEXT_VERSION: '1.1.0-rc.1' }, ['--no-start', '--version', 'next']);
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /\[PLAN\] DSH: next;/);
+    assert.doesNotMatch(result.stdout, /auto channel/);
+    assert.match(result.stdout, /\[INFO\] Resolved DSH 1\.1\.0-rc\.1, /);
+    assert.equal(installedVersion(base), '1.1.0-rc.1');
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

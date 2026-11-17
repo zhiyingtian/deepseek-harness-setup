@@ -9,7 +9,7 @@ umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DSH_BASE="${DSH_BASE:-$HOME/deepseek-harness}"
-DSH_VERSION="${DSH_VERSION:-latest}"
+DSH_VERSION="${DSH_VERSION:-}"
 NODE_VERSION="${NODE_VERSION:-}"
 PNPM_VERSION="${PNPM_VERSION:-11.7.0}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
@@ -21,20 +21,21 @@ NODE_VERSION_OVERRIDE=0
 
 usage() {
   cat <<'EOF'
-Usage: bash install-upgrade.sh [--version <version|latest|next>] [--no-start] [--dry-run]
+Usage: bash install-upgrade.sh [--version <version|tag>] [--no-start] [--dry-run]
 
 Run the same command to install or upgrade DSH on an online Ubuntu host.
 No sudo, global npm install, shell-profile changes or system service changes.
 
 Options:
-  --version VALUE  Select an exact npm version or dist-tag (default: latest).
+  --version VALUE  Select an exact npm version or dist-tag.
+                   Default: the newer of the registry's latest and next tags.
   --no-start       Install without starting Web; an existing service is stopped.
   --dry-run        Print the plan without network requests or filesystem changes.
   -h, --help       Show this help.
 
 Environment:
   DSH_BASE         Installation root (default: ~/deepseek-harness)
-  DSH_VERSION      npm version/tag (default: latest, not next)
+  DSH_VERSION      npm version/tag; default selects the newer of latest and next
   NODE_VERSION     Pin an official Node release, e.g. v24.9.0
                    (default: newest stable Node satisfying the DSH release engines.node)
   PNPM_VERSION     Exact pnpm release used for plugin management (default: 11.7.0)
@@ -42,6 +43,9 @@ Environment:
   NETWORK_TIMEOUT Network step timeout in seconds (default: 300)
 
 DSH data, workspace, logs, downloads and backups stay under DSH_BASE.
+By default the installer compares the npm latest and next tags and installs the
+newer version, so it also follows RC/pre-release builds. Use --version latest to
+stay on the stable tag, or --version <exact> to pin a release.
 Node is selected from the engines.node declared by the DSH version being installed:
 the newest stable release satisfying that range. Releases that declare no
 engines.node fall back to the Node 22 LTS line (>=22.19.0).
@@ -51,6 +55,7 @@ On startup failure, restore the previous program and Web profile, not all user d
 
 Examples:
   bash install-upgrade.sh
+  bash install-upgrade.sh --version latest
   bash install-upgrade.sh --version 0.2.1-rc.2
   NODE_VERSION=v26.13.0 bash install-upgrade.sh --version 0.2.2-rc.1
   DSH_BASE=/absolute/path/to/dsh bash install-upgrade.sh
@@ -69,11 +74,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 [[ "$DSH_BASE" = /* && "$DSH_BASE" != / ]] || die "DSH_BASE must be an absolute directory, not /"
-[[ "$DSH_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9.+_-]*$ ]] || die "Invalid DSH version/tag"
+[ -z "$DSH_VERSION" ] || [[ "$DSH_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9.+_-]*$ ]] || die "Invalid DSH version/tag"
 [[ "$PNPM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "PNPM_VERSION must be an exact pnpm release, e.g. 11.7.0"
 [[ "$NETWORK_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "NETWORK_TIMEOUT must be positive"
 echo "[PLAN] Install root: $DSH_BASE"
-echo "[PLAN] DSH: $DSH_VERSION; Node: ${NODE_VERSION:-auto from DSH engines.node (fallback Node 22 LTS)}; pnpm: $PNPM_VERSION"
+echo "[PLAN] DSH: ${DSH_VERSION:-auto (newer of latest/next)}; Node: ${NODE_VERSION:-auto from DSH engines.node (fallback Node 22 LTS)}; pnpm: $PNPM_VERSION"
 echo "[PLAN] Web: DSH default port (3080); start=$START_SERVICE; plugin=dshmarket"
 if [ "$DRY_RUN" = 1 ]; then
   echo "[DRY-RUN] No downloads or filesystem changes."
@@ -252,29 +257,73 @@ if __name__ == "__main__":
     main()
 PY
 
-# Read the published metadata for the requested DSH version/tag before choosing a
-# runtime: engines.node is the release's own contract for which Node it supports.
+# Read the published metadata before choosing a runtime: engines.node is the
+# release's own contract for which Node it supports. With no explicit version the
+# installer follows the newer of the latest and next tags, so it also tracks RCs.
 metadata="$DSH_BASE/downloads/dsh-packument.json"
 download "${NPM_REGISTRY%/}/@deepseek-ai%2fdsh" "$metadata" || die "Could not fetch DSH metadata from $NPM_REGISTRY"
 resolved="$(python3 - "$metadata" "$DSH_VERSION" <<'PY'
 import json
+import re
 import sys
+
+
+def version_key(text):
+    match = re.fullmatch(
+        r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?",
+        str(text).strip(),
+    )
+    if not match:
+        return None
+    major, minor, patch = (int(group) for group in match.groups()[:3])
+    prerelease = match.group(4)
+    if prerelease is None:
+        release_rank = (1,)
+    else:
+        identifiers = tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in prerelease.split(".")
+        )
+        release_rank = (0, identifiers)
+    return (major, minor, patch, release_rank)
+
 
 with open(sys.argv[1], encoding="utf-8") as source:
     packument = json.load(source)
 spec = sys.argv[2]
-version = (packument.get("dist-tags") or {}).get(spec) or spec
-manifest = (packument.get("versions") or {}).get(version)
+tags = packument.get("dist-tags") or {}
+versions = packument.get("versions") or {}
+note = ""
+if spec:
+    version = tags.get(spec) or spec
+else:
+    candidates = []
+    for name in ("latest", "next"):
+        candidate = tags.get(name)
+        if isinstance(candidate, str) and candidate in versions:
+            key = version_key(candidate)
+            if key is not None:
+                candidates.append((key, name, candidate))
+    if not candidates:
+        raise SystemExit("Neither the latest nor the next tag names a published version")
+    _, _, version = max(candidates)
+    note = "auto channel: " + ", ".join(
+        f"{name}={candidate}" for _, name, candidate in sorted(candidates, key=lambda item: item[1])
+    ) + f"; selected {version}"
+manifest = versions.get(version)
 if not isinstance(manifest, dict):
-    raise SystemExit(f"DSH {spec} is not published on the configured npm registry")
+    raise SystemExit(f"DSH {spec or 'latest/next'} is not published on the configured npm registry")
 engines = manifest.get("engines") if isinstance(manifest.get("engines"), dict) else {}
 print(manifest.get("version") or version)
 print(engines.get("node") or "")
+print(note)
 PY
-)" || die "Could not resolve DSH $DSH_VERSION; check the version/tag and NPM_REGISTRY"
+)" || die "Could not resolve DSH ${DSH_VERSION:-latest/next}; check the version/tag and NPM_REGISTRY"
 version="$(printf '%s\n' "$resolved" | sed -n '1p')"
 node_range="$(printf '%s\n' "$resolved" | sed -n '2p')"
+channel_note="$(printf '%s\n' "$resolved" | sed -n '3p')"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "Invalid resolved DSH version: $version"
+[ -z "$channel_note" ] || echo "[INFO] $channel_note"
 if [ -n "$node_range" ]; then
   node_select_range="$node_range"
   node_check_range="$node_range"

@@ -29,7 +29,7 @@ cd ~/workspace/deepseek-harness-setup
 bash install-upgrade.sh
 ```
 
-目录位置可以不同，两个 shell 脚本应放在同一个目录。首次执行安装，再次执行升级；不需要预先卸载。默认查询官方 npm 的 `latest`，不自动选择 `next` 或 alpha，但 `latest` 本身仍可能指向 RC；执行前后以实际输出版本为准。同一版本重复执行也会创建新的安装目录，并非跳过安装。
+目录位置可以不同，两个 shell 脚本应放在同一个目录。首次执行安装，再次执行升级；不需要预先卸载。默认比较官方 npm 的 `latest` 与 `next` 两个标签，安装其中**较新的版本**，因此会自动跟随 RC/预发布通道（`latest` 本身也可能指向 RC）；只想跟随 `latest` 标签用 `--version latest`（不自动跨到 next），要固定版本用 `--version <精确版本>`。预发布版本可能包含数据迁移或行为变化，升级前脚本仍会备份 `data`，启动失败时回滚程序与 Web profile。执行前后以实际输出版本为准。同一版本重复执行也会创建新的安装目录，并非跳过安装。
 
 升级时会重新读取新 dsh 版本的 `engines.node`：要求提高时自动下载对应 Node，已有运行时会保留在 `nodes/` 下不会被删除；若 `NODE_VERSION` 被手动固定为不满足新要求的版本，安装会在下载程序前失败，去掉该变量即可自动选择。
 
@@ -39,7 +39,7 @@ bash install-upgrade.sh
 
 | 参数 | 行为 |
 |---|---|
-| `--version <值>` | 指定 npm 精确版本或发布标签，优先于 `DSH_VERSION` |
+| `--version <值>` | 指定 npm 精确版本或发布标签，优先于 `DSH_VERSION`；不指定时取 `latest` 与 `next` 中较新者 |
 | `--dry-run` | 仅显示计划，不联网、不写文件、不验证远端版本是否存在，也不解析 `engines.node` |
 | `--no-start` | 安装完成后不启动 Web；升级时若旧服务正在运行，会先停止它 |
 | `-h`、`--help` | 显示帮助 |
@@ -50,6 +50,9 @@ bash install-upgrade.sh --version 0.2.1-rc.2
 
 # 明确选择 next 通道
 bash install-upgrade.sh --version next
+
+# 只跟随 latest 标签，不自动跟随 next
+bash install-upgrade.sh --version latest
 
 # 预览计划
 bash install-upgrade.sh --dry-run
@@ -64,7 +67,7 @@ bash dshctl.sh start
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `DSH_BASE` | `~/deepseek-harness` | 安装和数据根目录，必须是绝对路径且不能是 `/` |
-| `DSH_VERSION` | `latest` | dsh 的 npm 版本或发布标签 |
+| `DSH_VERSION` | 自动（`latest` 与 `next` 中较新者） | 显式设置时只解析该版本或标签；例如 `latest` 只解析 latest 标签、`next` 只解析 next 标签 |
 | `NODE_VERSION` | 自动选择满足所选 dsh `engines.node` 的最新稳定版本 | 可固定为官方版本，例如 `v24.22.2`（长期支持版）；必须满足该 dsh 版本的 `engines.node`，否则安装失败 |
 | `PNPM_VERSION` | `11.7.0` | 插件管理使用的 pnpm 精确版本；安装后会验证它能被所选 Node 运行 |
 | `NPM_REGISTRY` | `https://registry.npmjs.org` | npm registry，同时用于读取 dsh 版本元数据，不改变 nodejs.org 的下载地址 |
